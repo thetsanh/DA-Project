@@ -11,6 +11,7 @@ import plotly.graph_objects as go
 import folium
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
+import colorsys, hashlib
 
 # -------------------- CONFIG: file paths --------------------
 DATA_DIR = Path("data")
@@ -195,7 +196,62 @@ def get_metric(model_info: dict, key_variants):
                     if val is not None:
                         return val
     return None
+# Unique, stable color per route id
 
+def color_for_ref(ref: str) -> str:
+    h = int(hashlib.md5(ref.encode("utf-8")).hexdigest(), 16)
+    hue = (h % 360) / 360.0              # 0..1
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.65, 0.95)
+    return "#{:02x}{:02x}{:02x}".format(int(r*255), int(g*255), int(b*255))
+
+# ---------- Trip Finder helpers (ADD THIS) ----------
+def _hav_km(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    lat1 = np.radians(lat1); lon1 = np.radians(lon1)
+    lat2 = np.radians(lat2); lon2 = np.radians(lon2)
+    dlat = lat2 - lat1; dlon = lon2 - lon1
+    a = np.sin(dlat/2)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
+    return 2 * R * np.arcsin(np.sqrt(a))
+
+def nearest_vertex_index(coords_latlon, lat, lon):
+    """Return index of the nearest vertex along a route polyline (coords as [lat,lon])."""
+    if not coords_latlon:
+        return None, np.inf
+    arr = np.array(coords_latlon, dtype=float)  # N x 2
+    d = _hav_km(arr[:,0], arr[:,1], lat, lon)
+    i = int(np.argmin(d))
+    return i, float(d[i])
+
+def route_covers_od(route_row, o_lat, o_lon, d_lat, d_lon, radius_m=350):
+    """Check if the route passes near origin then destination (within radius_m)."""
+    coords_latlon = route_row.get("latlon", [])
+    if not coords_latlon:
+        return False, None, None, None, None
+    oi, od_km = nearest_vertex_index(coords_latlon, o_lat, o_lon)
+    di, dd_km = nearest_vertex_index(coords_latlon, d_lat, d_lon)
+    if oi is None or di is None:
+        return False, None, None, None, None
+    # both points close enough and order is origin->destination
+    if od_km*1000.0 <= radius_m and dd_km*1000.0 <= radius_m and oi < di:
+        return True, oi, di, od_km, dd_km
+    return False, oi, di, od_km, dd_km
+
+def estimate_time_between_indices(ref, oi, di, routes_df, route_models, feature_columns):
+    """
+    If a model exists for `ref`, build predicted per-segment times and
+    return time (min) between vertex indices [oi -> di).
+    """
+    if ref not in route_models:
+        return None
+    seg_df, err = build_segment_times_from_model(ref, routes_df, route_models, feature_columns)
+    if err or seg_df is None or seg_df.empty:
+        return None
+    # segment i connects vertex i -> i+1 ; sum from oi .. di-1
+    mask = (seg_df["segment_index"] >= (oi+1)) & (seg_df["segment_index"] <= di)
+    part = seg_df.loc[mask]
+    if part.empty:
+        return None
+    return float(part["segment_travel_time_min"].sum())
 
 # -------------------- load base data --------------------
 traffic = load_csv(TRAFFIC_CSV)
@@ -329,11 +385,11 @@ else:
 st.markdown("---")
 
 # -------------------- Tabs (raw-route tab REMOVED) --------------------
-tab_map, tab_dist, tab_temporal, tab_zones, tab_segments = st.tabs(
-    ["🗺️ Map", "📊 Speed Distribution", "⏱️ Temporal", "🚧 Zones", "🧩 Segment Times"]
+tab_map, tab_dist, tab_temporal, tab_zones, tab_segments, tab_finder = st.tabs(
+    ["🗺️ Map", "📊 Speed Distribution", "⏱️ Temporal", "🚧 Zones", "🧩 Segment Times", "🚌 Route Finder"]
 )
 
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
 # STOPS helper: pick stops near route polyline  (ADDED FUNCTION)
 def stops_near_route(stops_df, coords_latlon, radius_m=300):
     """Return only the stops within ~radius_m of the route polyline."""
@@ -376,7 +432,7 @@ def stops_near_route(stops_df, coords_latlon, radius_m=300):
         dmin = np.minimum(dmin, d)
 
     return box.loc[dmin <= (radius_m/1000.0)]
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
 
 # MAP
 with tab_map:
@@ -494,3 +550,118 @@ with tab_segments:
                        labels={"segment_index":"Segment #","cumulative_min":"Cumulative Time (min)"})
         figC.update_layout(margin=dict(l=10,r=10,t=10,b=10))
         st.plotly_chart(figC, use_container_width=True)
+
+# 🚌 ROUTE FINDER TAB
+with tab_finder:
+    st.subheader("Find buses from Origin → Destination")
+    if stops is None or stops.empty:
+        st.info("No stops file found. Please ensure `cleaned_bus_stops_file.csv` exists.")
+    else:
+        # pick stops by name (fast and friendly)
+        smap = {c.lower(): c for c in stops.columns}
+        s_lat = smap["lat"]; s_lon = smap["lon"]
+        s_name = smap.get("refname") or smap.get("name") or smap.get("stop_name")
+
+        # light search UI
+        c1, c2 = st.columns(2)
+        with c1:
+            o_name = st.selectbox("Origin stop", options=stops[s_name].astype(str).tolist(), index=0)
+        with c2:
+            d_name = st.selectbox("Destination stop", options=stops[s_name].astype(str).tolist(), index=1)
+
+        # resolve to lat/lon
+        o_row = stops.loc[stops[s_name] == o_name].iloc[0]
+        d_row = stops.loc[stops[s_name] == d_name].iloc[0]
+        o_lat, o_lon = float(o_row[s_lat]), float(o_row[s_lon])
+        d_lat, d_lon = float(d_row[s_lat]), float(d_row[s_lon])
+
+        radius_m = st.slider("Match radius (m)", 150, 600, 350, 50)
+
+        # --- Search scope fixed to trained routes (first 100) ---
+        st.caption("Searching in: **trained routes (first 100)**")
+        search_df = routes_trained
+        scope = "Trained routes (first 100)"
+
+        # Find candidates
+        results = []
+        for _, r in search_df.iterrows():
+            ok, oi, di, od_km, dd_km = route_covers_od(r, o_lat, o_lon, d_lat, d_lon, radius_m=radius_m)
+            if not ok:
+                continue
+            ref = str(r["ref"])
+            name = r.get("name", "")
+            # time estimate if we have a model
+            est_min = estimate_time_between_indices(ref, oi, di, routes_trained if scope.startswith("Trained") else routes, route_models, feature_columns)
+            trained = ref in route_models
+            results.append({
+                "ref": ref,
+                "name": name,
+                "trained_model": int(trained),      # <-- added so we can sort without KeyError
+                "nearest_vertex_origin": oi,
+                "nearest_vertex_dest": di,
+                "dist_to_origin_m": round(od_km*1000.0, 1),
+                "dist_to_dest_m": round(dd_km*1000.0, 1),
+                "est_time_min_between": (round(est_min, 2) if est_min is not None else "—")
+            })
+
+        if not results:
+            st.info("No bus routes found that pass near both stops with the given radius (and correct direction). Try increasing the radius.")
+        else:
+            res_df = pd.DataFrame(results)
+            # numeric copy for sorting; "—" -> NaN -> +inf so it sorts last
+            res_df["__sort_time__"] = pd.to_numeric(res_df["est_time_min_between"], errors="coerce").fillna(np.inf)
+            res_df = res_df.sort_values(
+                by=["trained_model", "__sort_time__"], ascending=[False, True]
+            ).drop(columns="__sort_time__")
+
+            st.markdown("**Matching bus routes:**")
+            st.dataframe(res_df, use_container_width=True, height=360)
+
+            # Small map visualization
+            fmap = folium.Map(location=[(o_lat+d_lat)/2, (o_lon+d_lon)/2], zoom_start=12, tiles="CartoDB positron")
+            # origin/destination markers
+            folium.Marker([o_lat, o_lon], tooltip=f"Origin: {o_name}", icon=folium.Icon(color="green")).add_to(fmap)
+            folium.Marker([d_lat, d_lon], tooltip=f"Destination: {d_name}", icon=folium.Icon(color="red")).add_to(fmap)
+
+            # draw up to first 8 candidate polylines, each in a unique color
+            legend_items = []
+            for _, row in res_df.head(8).iterrows():
+                ref = row["ref"]
+                rr = search_df.loc[search_df["ref"] == ref].iloc[0]
+                coords_latlon = rr.get("latlon", [])
+                if not coords_latlon:
+                    continue
+                col = color_for_ref(ref)
+                folium.PolyLine(
+                    coords_latlon,
+                    weight=5,
+                    opacity=0.85,
+                    color=col,
+                    tooltip=f"Route {ref} — {rr.get('name','')}",
+                ).add_to(fmap)
+                legend_items.append((ref, rr.get("name",""), col))
+
+            # simple legend
+            # simple legend (force black text)
+            if legend_items:
+                legend_html = '''
+                <div style="
+                    position: fixed; bottom: 20px; left: 20px; z-index: 9999;
+                    background: #ffffff; padding: 10px 12px; border: 1px solid #bbb; border-radius: 8px;
+                    font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,.15); max-width: 280px;
+                    color:#111; opacity:1; ">
+                    <b style="color:#111;">Routes shown</b><br/>
+                '''
+                for ref, name, col in legend_items:
+                    label = (name if name else ref)
+                    legend_html += (
+                        '<div style="display:flex;align-items:center;margin-top:6px;color:#111;">'
+                        f'<span style="display:inline-block;width:14px;height:14px;background:{col};'
+                        'border:1px solid #666;margin-right:8px;border-radius:3px;"></span>'
+                        f'<span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#111;">'
+                        f'{ref} — {label}</span></div>'
+                    )
+                legend_html += '</div>'
+                fmap.get_root().html.add_child(folium.Element(legend_html))
+
+            st_folium(fmap, height=560, width=None)
