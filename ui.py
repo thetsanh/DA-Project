@@ -22,8 +22,8 @@ ROUTES_CSV  = CLEAN_DIR / "cleaned_bus_routes_file.csv"
 STOPS_CSV   = CLEAN_DIR / "cleaned_bus_stops_file.csv"
 ZONES_CSV   = CLEAN_DIR / "congestion_zones.csv"
 
-ROUTE_MODELS_PKL    = DATA_DIR / "route_models.pkl"
-FEATURE_COLUMNS_PKL = DATA_DIR / "feature_columns.pkl"
+ROUTE_MODELS_PKL    = DATA_DIR / "route_models_m3.pkl"
+FEATURE_COLUMNS_PKL = DATA_DIR / "feature_columns_m3.pkl"
 
 # -------------------- PAGE LOOK --------------------
 st.set_page_config(page_title="Bangkok Bus Insights", layout="wide")
@@ -312,25 +312,21 @@ if traffic is not None:
         traffic["day_of_week"] = 0
 
 # -------------------- LOAD MODELS --------------------
-route_models = {}
-feature_columns = {}
-
-pkl_error = None
-if ROUTE_MODELS_PKL.exists():
-    try:
+@st.cache_resource(show_spinner=False)
+def load_models():
+    route_models = {}
+    feature_columns = {}
+    if ROUTE_MODELS_PKL.exists():
         with open(ROUTE_MODELS_PKL, "rb") as f:
             raw = pickle.load(f)
         route_models = {str(k).strip(): v for k, v in raw.items()}
-    except Exception as e:
-        pkl_error = str(e)
-        st.error(f"Could not load pickle {ROUTE_MODELS_PKL}: {e}")
-
-if FEATURE_COLUMNS_PKL.exists():
-    try:
+    if FEATURE_COLUMNS_PKL.exists():
         with open(FEATURE_COLUMNS_PKL, "rb") as f:
             feature_columns = pickle.load(f)
-    except Exception as e:
-        st.warning(f"Could not load feature columns {FEATURE_COLUMNS_PKL}: {e}")
+    return route_models, feature_columns
+
+route_models, feature_columns = load_models()
+
 
 # -------------------- SMART MAP: PKL -> CSV['ref'] --------------------
 def _norm_str(x: object) -> str:
@@ -403,16 +399,17 @@ else:
     route_models = {}
 
 # -------------------- BUILD SEGMENT TIMES --------------------
-def build_segment_times_from_model(sel_ref, routes_df, route_models, feature_columns):
+@st.cache_data(show_spinner=False)
+def build_segment_times_from_model(sel_ref, routes_df, _route_models, _feature_columns):
     """
     Use the trained model for sel_ref to predict speed per segment right now.
     - Builds base + optional engineered features (heading, grids, distances).
     - Aligns to the model's expected column order; missing cols -> 0.
     """
-    if sel_ref not in route_models:
+    if sel_ref not in _route_models:
         return None, "No model for this route in PKL."
 
-    model_info = route_models[sel_ref]
+    model_info = _route_models[sel_ref]
     model = model_info.get("model", None)
     if model is None:
         return None, "Model object missing in PKL entry."
@@ -423,39 +420,32 @@ def build_segment_times_from_model(sel_ref, routes_df, route_models, feature_col
     row = row.iloc[0]
 
     coords = row.get("coordinates", [])
-    seg_d  = row.get("segment_distance_list", [])
+    seg_d = row.get("segment_distance_list", [])
     if not isinstance(coords, list) or not isinstance(seg_d, list) or len(coords) < 2:
         return None, "Missing coordinates or segment distances."
 
-    n = min(len(coords)-1, len(seg_d))
+    n = min(len(coords) - 1, len(seg_d))
 
-    # Build features per segment (use both start & next vertex for engineered cols)
     feats = []
     for i in range(n):
         lon1, lat1 = coords[i][0], coords[i][1]
-        lon2, lat2 = coords[i+1][0], coords[i+1][1]
+        lon2, lat2 = coords[i + 1][0], coords[i + 1][1]
         feats.append(
             _feature_row_with_optionals(
                 lat=lat1, lon=lon1, next_lat=lat2, next_lon=lon2, zones_df=zones
             )
         )
 
-    # Figure out expected column order
     feat_cols = None
-    if isinstance(feature_columns, dict):
-        # try a few keys that may have been stored
-        feat_cols = feature_columns.get(sel_ref) or \
-                    feature_columns.get(model_info.get("features_used_key", ""), None)
+    if isinstance(_feature_columns, dict):
+        feat_cols = _feature_columns.get(sel_ref) or \
+                    _feature_columns.get(model_info.get("features_used_key", ""), None)
     if feat_cols is None:
         feat_cols = model_info.get("features_used", None)
 
     dfX = pd.DataFrame(feats)
-
     if feat_cols is None:
-        # If the PKL doesn't say, just use whatever we built (sorted for stability)
         feat_cols = list(dfX.columns)
-
-    # IMPORTANT: align & fill missing columns (avoid KeyError)
     X = dfX.reindex(columns=feat_cols, fill_value=0)
 
     try:
@@ -469,9 +459,11 @@ def build_segment_times_from_model(sel_ref, routes_df, route_models, feature_col
     for i in range(n):
         seg_rows.append({
             "ref": sel_ref,
-            "segment_index": i+1,
-            "start_lon": coords[i][0],  "start_lat": coords[i][1],
-            "end_lon":   coords[i+1][0], "end_lat":   coords[i+1][1],
+            "segment_index": i + 1,
+            "start_lon": coords[i][0],
+            "start_lat": coords[i][1],
+            "end_lon": coords[i + 1][0],
+            "end_lat": coords[i + 1][1],
             "distance_km": float(seg_d[i]),
             "predicted_speed_kmh": float(y_speed[i]),
             "segment_travel_time_min": float(seg_minutes[i]),
@@ -480,6 +472,7 @@ def build_segment_times_from_model(sel_ref, routes_df, route_models, feature_col
     seg_df["cumulative_distance_km"] = seg_df.groupby("ref")["distance_km"].cumsum()
     seg_df["cumulative_travel_time_min"] = seg_df.groupby("ref")["segment_travel_time_min"].cumsum()
     return seg_df, None
+
 
 
 # -------------------- PICK ROUTES TO SHOW --------------------
@@ -524,7 +517,7 @@ r2_val  = get_metric(model_info, ["R2","r2","r2_score","r^2"])
 
 # -------------------- TRY SEGMENT PREDICTIONS --------------------
 seg_df, seg_err = (None, "Predictions disabled.") if sel_ref not in route_models else \
-                  build_segment_times_from_model(sel_ref, routes_trained, route_models, feature_columns)
+                  build_segment_times_from_model(sel_ref, routes_trained, _route_models=route_models, _feature_columns=feature_columns)
 
 # -------------------- OVERVIEW CARDS --------------------
 st.markdown("### Overview (filtered to selected route where possible)")
